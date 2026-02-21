@@ -1,33 +1,16 @@
 #!/usr/bin/env python3
-"""YouTube Summarizer Dashboard — paste a link, get a summary."""
+"""YouTube Summarizer Dashboard — paste a link, get an AI summary."""
 
 import json
-import math
+import os
 import re
 import urllib.request
 import webbrowser
-from collections import Counter
 
 from flask import Flask, jsonify, render_template_string, request
 from youtube_transcript_api import YouTubeTranscriptApi
 
 app = Flask(__name__)
-
-STOP_WORDS = frozenset(
-    "a about above after again against all am an and any are aren't as at be because been "
-    "before being below between both but by can can't cannot could couldn't did didn't do does "
-    "doesn't doing don't down during each few for from further get got had hadn't has hasn't "
-    "have haven't having he he'd he'll he's her here here's hers herself him himself his how "
-    "how's i i'd i'll i'm i've if in into is isn't it it's its itself just let's me more most "
-    "mustn't my myself no nor not of off on once one only or other ought our ours ourselves out "
-    "over own really right said same say she she'd she'll she's should shouldn't so some such "
-    "than that that's the their theirs them themselves then there there's these they they'd "
-    "they'll they're they've this those through to too under until up us very want was wasn't we "
-    "we'd we'll we're we've were weren't what what's when when's where where's which while who "
-    "who's whom why why's will with won't would wouldn't you you'd you'll you're you've your "
-    "yours yourself yourselves going go know like well also got thing things think gonna "
-    "yeah yes okay oh actually um uh ah hey hi sort kind way basically".split()
-)
 
 
 def extract_video_id(url: str) -> str:
@@ -65,98 +48,40 @@ def fetch_transcript(video_id: str, lang: str = "en") -> str:
         raise RuntimeError(f"Error fetching transcript: {e}") from e
 
 
-def split_sentences(text: str) -> list[str]:
-    """Split text into sentences, handling poorly-punctuated transcripts."""
-    text = re.sub(r"\s+", " ", text).strip()
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    sentences = []
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        if len(part.split()) > 40:
-            clauses = re.split(r",\s+(?=[A-Z])| and (?=[A-Z])| but (?=[A-Z])| so (?=[A-Z])", part)
-            sentences.extend(c.strip() for c in clauses if len(c.strip().split()) >= 4)
-        else:
-            if len(part.split()) >= 4:
-                sentences.append(part)
-    return sentences
-
-
-def tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-z]+", text.lower())
-
-
-def score_sentences(sentences: list[str]) -> list[float]:
-    """Score sentences using TF-IDF plus position bias."""
-    sent_tokens = []
-    for s in sentences:
-        tokens = [t for t in tokenize(s) if t not in STOP_WORDS and len(t) > 2]
-        sent_tokens.append(tokens)
-
-    num_sents = len(sentences)
-    df = Counter()
-    for tokens in sent_tokens:
-        for t in set(tokens):
-            df[t] += 1
-
-    scores = []
-    for idx, tokens in enumerate(sent_tokens):
-        if not tokens:
-            scores.append(0.0)
-            continue
-        tf = Counter(tokens)
-        tfidf = sum(
-            (1 + math.log(tf[t])) * math.log(num_sents / df[t])
-            for t in tf
-        )
-        tfidf /= math.sqrt(len(tokens))
-
-        pos = idx / num_sents
-        if pos < 0.10:
-            tfidf *= 1.3
-        elif pos > 0.95:
-            tfidf *= 1.15
-
-        scores.append(tfidf)
-    return scores
-
-
 def summarize(text: str, mode: str = "medium") -> str:
-    """Chunked extractive summarization.
+    """Summarize text using Groq's LLM API."""
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY environment variable is not set. Get a free key at console.groq.com")
 
-    mode: "brief" (~125 words), "medium" (~400 words), "long" (~600 words)
-    """
-    sentences = split_sentences(text)
-    if len(sentences) <= 8:
-        return "\n\n".join(sentences)
+    word_targets = {"brief": "125", "medium": "400", "long": "600"}
+    target = word_targets.get(mode, "400")
 
-    scores = score_sentences(sentences)
-    pick_per_chunk = {"brief": 1, "medium": 2, "long": 3}.get(mode, 2)
-    num_divisions = {"brief": 7, "medium": 10, "long": 10}.get(mode, 10)
+    payload = json.dumps({
+        "model": "llama-3.1-8b-instant",
+        "messages": [
+            {"role": "system", "content": f"You are a helpful summarizer. Summarize the following video transcript in about {target} words. Write clear, well-structured paragraphs. Do not use bullet points or lists."},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.3,
+    }).encode()
 
-    chunk_size = max(8, len(sentences) // num_divisions)
-    chunks = []
-    for i in range(0, len(sentences), chunk_size):
-        chunks.append(list(range(i, min(i + chunk_size, len(sentences)))))
-
-    selected = []
-    for chunk_indices in chunks:
-        ranked = sorted(chunk_indices, key=lambda i: scores[i], reverse=True)
-        best = sorted(ranked[:pick_per_chunk])
-        selected.extend(best)
-
-    paragraphs = []
-    current = [sentences[selected[0]]]
-    for i in range(1, len(selected)):
-        gap = selected[i] - selected[i - 1]
-        if gap > chunk_size // 2:
-            paragraphs.append(" ".join(current))
-            current = []
-        current.append(sentences[selected[i]])
-    paragraphs.append(" ".join(current))
-
-    return "\n\n".join(paragraphs)
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "yt-summarizer/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            return data["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        raise RuntimeError(f"Groq API error ({e.code}): {body}") from e
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -217,7 +142,7 @@ PAGE_HTML = """\
 </head>
 <body>
   <h1>YouTube Summarizer</h1>
-  <p class="subtitle">Paste a YouTube link to get a transcript summary.</p>
+  <p class="subtitle">Paste a YouTube link to get an AI-powered summary.</p>
   <form id="form">
     <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=..." required>
     <button type="submit" id="btn">Summarize</button>
